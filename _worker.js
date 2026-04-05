@@ -388,13 +388,18 @@ async function sendOwnerStatus(env) {
   const webhook = webhookOk ? webhookInfo.result || {} : null;
   const webhookStatus = webhookOk ? (webhook.url ? "已设置" : "未设置") : "获取失败";
 
-  const healthSummary = webhookOk && webhook?.url && !webhook?.last_error_message && (webhook?.pending_update_count ?? 0) < 10
-    ? "正常"
-    : "需要检查";
+  const healthSummary =
+    webhookOk &&
+    webhook?.url &&
+    !webhook?.last_error_message &&
+    (webhook?.pending_update_count ?? 0) < 10
+      ? "正常"
+      : "需要检查";
 
-  const lastErrorText = webhookOk && (webhook.last_error_message || webhook.last_error_date)
-    ? `${webhook.last_error_message || "未知错误"}${webhook.last_error_date ? `\n  时间：${formatUnixSeconds(webhook.last_error_date)}` : ""}`
-    : "无";
+  const lastErrorText =
+    webhookOk && (webhook.last_error_message || webhook.last_error_date)
+      ? `${webhook.last_error_message || "未知错误"}${webhook.last_error_date ? `\n  时间：${formatUnixSeconds(webhook.last_error_date)}` : ""}`
+      : "无";
 
   const statusText =
     `📊 Bot 状态面板\n` +
@@ -607,9 +612,8 @@ async function sendVerification(
 
   const state = {
     userId: String(userId),
-    sequence: challenge.sequence,
+    targetEmoji: challenge.targetEmoji,
     buttons: challenge.buttons,
-    currentStep: 0,
     failCount: 0,
     showWelcomeAfterVerify: !!showWelcomeAfterVerify,
     pendingMessageIds: pendingMessageId ? [pendingMessageId] : [],
@@ -744,63 +748,41 @@ async function handleCallbackQuery(cbq, env) {
   }
 
   const selectedEmoji = state.buttons[selectedButtonIndex];
-  const expectedEmoji = state.sequence[state.currentStep];
+  const expectedEmoji = state.targetEmoji;
 
   if (selectedEmoji === expectedEmoji) {
-    state.currentStep += 1;
+    await env.BOT_KV.put(Keys.verified(userId), "1", {
+      expirationTtl: CONFIG.VERIFIED_TTL
+    });
 
-    if (state.currentStep >= state.sequence.length) {
-      await env.BOT_KV.put(Keys.verified(userId), "1", {
-        expirationTtl: CONFIG.VERIFIED_TTL
-      });
-
-      await clearChallenge(env, challengeId, userId);
-      await env.BOT_KV.delete(Keys.verifyCooldown(userId));
-
-      await tgCall(env, "answerCallbackQuery", {
-        callback_query_id: cbq.id,
-        text: TEXTS.VERIFY_PASS
-      });
-
-      await editMessageTextSafe(env, {
-        chat_id: userId,
-        message_id: cbq.message?.message_id,
-        text: TEXTS.VERIFIED_OK
-      });
-
-      await forwardPendingMessagesAfterVerification(state, env);
-
-      if (state.showWelcomeAfterVerify) {
-        await sendStartPack(userId, env);
-      }
-
-      logEvent("info", "verification_passed", {
-        userId,
-        showWelcomeAfterVerify: !!state.showWelcomeAfterVerify
-      });
-      return;
-    }
-
-    await saveChallenge(env, challengeId, state);
+    await clearChallenge(env, challengeId, userId);
+    await env.BOT_KV.delete(Keys.verifyCooldown(userId));
 
     await tgCall(env, "answerCallbackQuery", {
       callback_query_id: cbq.id,
-      text: `正确，继续点击下一个 (${state.currentStep}/${state.sequence.length})`
+      text: TEXTS.VERIFY_PASS
     });
 
     await editMessageTextSafe(env, {
       chat_id: userId,
       message_id: cbq.message?.message_id,
-      text: buildVerifyText(state),
-      reply_markup: {
-        inline_keyboard: buildVerifyKeyboard(state, challengeId)
-      }
+      text: TEXTS.VERIFIED_OK
+    });
+
+    await forwardPendingMessagesAfterVerification(state, env);
+
+    if (state.showWelcomeAfterVerify) {
+      await sendStartPack(userId, env);
+    }
+
+    logEvent("info", "verification_passed", {
+      userId,
+      showWelcomeAfterVerify: !!state.showWelcomeAfterVerify
     });
     return;
   }
 
   state.failCount = Number(state.failCount || 0) + 1;
-  state.currentStep = 0;
 
   if (state.failCount >= CONFIG.VERIFY_FAIL_MAX) {
     await clearChallenge(env, challengeId, userId);
@@ -826,6 +808,10 @@ async function handleCallbackQuery(cbq, env) {
     });
     return;
   }
+
+  const refreshed = generateEmojiChallenge();
+  state.targetEmoji = refreshed.targetEmoji;
+  state.buttons = refreshed.buttons;
 
   await saveChallenge(env, challengeId, state);
 
@@ -903,22 +889,16 @@ function generateEmojiChallenge() {
     "🚗", "🚲", "✈️", "🚀", "🎈", "🎁"
   ];
 
-  const picked = shuffle(pool).slice(0, 6);
-  const sequence = picked.slice(0, 3);
-  const buttons = shuffle(picked);
+  const buttons = shuffle(pool).slice(0, 4);
+  const targetEmoji = buttons[randInt(0, buttons.length - 1)];
 
-  return { sequence, buttons, currentStep: 0 };
+  return { targetEmoji, buttons };
 }
 
 function buildVerifyText(state) {
-  const target = state.sequence.join(" → ");
-  const current = Number(state.currentStep || 0);
-  const total = state.sequence.length;
-
   return (
     `🛡️ 人机验证\n\n` +
-    `请按顺序点击：\n${target}\n\n` +
-    `当前进度：${current}/${total}`
+    `请点击下面的表情：\n${state.targetEmoji}`
   );
 }
 
@@ -928,7 +908,7 @@ function buildVerifyKeyboard(state, challengeId) {
       text: emoji,
       callback_data: `verify:${challengeId}:${idx}`
     })),
-    3
+    2
   );
 }
 
