@@ -154,10 +154,7 @@ BOT_KV
 部署成功后，把 Telegram webhook 指向你的 Worker 地址：
 
 ```bash
-curl -X POST "https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook"   -H "Content-Type: application/json"   -d '{
-    "url": "https://你的workers地址",
-    "allowed_updates": ["message", "callback_query"]
-  }'
+https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://your-worker-name.your-subdomain.workers.dev
 ```
 
 ---
@@ -167,7 +164,7 @@ curl -X POST "https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook"   -H "Co
 执行：
 
 ```bash
-curl "https://api.telegram.org/bot<你的BOT_TOKEN>/getWebhookInfo"
+https://api.telegram.org/bot<你的BOT_TOKEN>/getWebhookInfo
 ```
 
 重点看：
@@ -183,7 +180,7 @@ curl "https://api.telegram.org/bot<你的BOT_TOKEN>/getWebhookInfo"
 先清掉旧 webhook 和积压更新：
 
 ```bash
-curl "https://api.telegram.org/bot<你的BOT_TOKEN>/deleteWebhook?drop_pending_updates=true"
+https://api.telegram.org/bot<你的BOT_TOKEN>/deleteWebhook?drop_pending_updates=true
 ```
 
 然后重新设置 webhook。
@@ -219,35 +216,6 @@ curl "https://api.telegram.org/bot<你的BOT_TOKEN>/deleteWebhook?drop_pending_u
 - **直接回复** 机器人转发的那条消息
 
 即可把消息回传给对应用户。
-
----
-
-## `/status` 日常版示例
-
-```text
-📊 Bot 状态
-
-- 健康状态：正常
-- Webhook：已设置
-- 待处理更新：1
-- 最后错误：无
-
-👤 主人
-- Owner ID：5762770125
-- 封禁状态：否
-
-⚙️ 环境
-- BOT_KV：已绑定
-- START_PHOTO_FILE_ID：未设置
-
-🛡️ 验证
-- 冷却时间：60s
-- 失败上限：3
-
-🚦 限流
-- 已验证：20/60s
-- 未验证：6/60s
-```
 
 ---
 
@@ -304,48 +272,6 @@ curl "https://api.telegram.org/bot<你的BOT_TOKEN>/deleteWebhook?drop_pending_u
 - 先做人机验证
 - 验证通过后
 - 再自动转交刚才的消息
-
----
-
-### 为什么不用 Durable Objects？
-
-当前项目定位是：
-
-- 个人使用
-- 单文件
-- 轻量部署
-- 低维护成本
-
-所以当前版本保持：
-
-- Workers + KV
-- 不引入 DO
-
----
-
-## 项目定位
-
-当前版本有意保持为：
-
-- 单文件 Worker
-- Workers + KV
-- 不拆复杂架构
-- 不引入 Durable Objects
-- 以实用和轻量为主
-
----
-
-## 已知边界
-
-当前版本是个人实用型项目，不是企业级强一致系统。
-
-已知边界：
-
-- KV 限流 / 去重 / challenge 状态不是强一致
-- `owner_msg` 映射过期后，无法继续回复旧消息
-- 不做消息历史归档
-
-对于个人私聊中继场景，这些通常可以接受。
 
 ---
 
