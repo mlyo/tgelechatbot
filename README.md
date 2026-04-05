@@ -167,12 +167,6 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=https://your-worker
 https://api.telegram.org/bot<你的BOT_TOKEN>/getWebhookInfo
 ```
 
-重点看：
-
-- `url` 是否正确
-- `last_error_message` 是否为空
-- `pending_update_count` 是否正常
-
 ---
 
 ### 8. 如果 Webhook 异常
