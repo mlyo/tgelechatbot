@@ -14,14 +14,21 @@ export default {
     }
 
     const contentType = request.headers.get("content-type") || "";
-    if (!contentType.includes("application/json")) {
+    if (!contentType.toLowerCase().includes("application/json")) {
       return new Response("Unsupported Media Type", { status: 415 });
     }
 
-    const contentLength = Number(request.headers.get("content-length") || "0");
-    if (contentLength > CONFIG.MAX_WEBHOOK_BODY_BYTES) {
-      logEvent("warn", "webhook_body_too_large", { contentLength });
-      return new Response("Payload Too Large", { status: 413 });
+    const contentLengthHeader = request.headers.get("content-length");
+    if (contentLengthHeader !== null) {
+      const contentLength = Number(contentLengthHeader);
+      if (!Number.isFinite(contentLength) || contentLength < 0) {
+        return new Response("Bad Request", { status: 400 });
+      }
+
+      if (contentLength > CONFIG.MAX_WEBHOOK_BODY_BYTES) {
+        logEvent("warn", "webhook_body_too_large", { contentLength });
+        return new Response("Payload Too Large", { status: 413 });
+      }
     }
 
     let update;
@@ -31,16 +38,21 @@ export default {
       return new Response("Bad Request", { status: 400 });
     }
 
-    try {
-      await processUpdate(update, env);
-    } catch (error) {
-      logEvent("error", "worker_error", {
-        updateId: update?.update_id ?? null,
-        error: error?.message || String(error)
-      });
+    if (!isPlainObject(update)) {
+      return new Response("Bad Request", { status: 400 });
     }
 
-    return new Response("OK");
+    try {
+      await processUpdate(update, env);
+      return new Response("OK");
+    } catch (error) {
+      logEvent("error", "worker_error", {
+        updateId: getUpdateId(update),
+        error: error?.message || String(error)
+      });
+
+      return new Response("Internal Server Error", { status: 500 });
+    }
   }
 };
 
@@ -61,7 +73,11 @@ const CONFIG = {
   RATE_LIMIT_WINDOW_UNVERIFIED: 60,
   RATE_LIMIT_VERIFIED_MAX: 20,
   RATE_LIMIT_UNVERIFIED_MAX: 6,
-  MAX_WEBHOOK_BODY_BYTES: 256 * 1024
+  MAX_WEBHOOK_BODY_BYTES: 256 * 1024,
+  TELEGRAM_MAX_ATTEMPTS: 3,
+  TELEGRAM_REQUEST_TIMEOUT_MS: 8000,
+  TELEGRAM_RETRY_BASE_MS: 300,
+  TELEGRAM_RETRY_MAX_MS: 1500
 };
 
 const Keys = {
@@ -86,6 +102,8 @@ const TEXTS = {
   VERIFY_LOCKED: "答错 3 次，请 60 秒后再试。",
   VERIFY_LOCKED_MESSAGE: "❌ 你已连续答错 3 次，请 60 秒后再试。",
   VERIFY_COOLDOWN: "你操作太快了，验证失败次数过多，请 60 秒后再试。",
+  VERIFY_ALREADY_SENT: "验证题已发送，请先完成验证。",
+  VERIFY_STATE_RESET: "验证状态异常，已为你重新发送一题。",
   BANNED: "你已被封禁。",
   MESSAGE_RECEIVED: "已收到，消息已转交。",
   DIRECT_REPLY_HINT: "请直接回复我转给你的那条消息，这样我才能知道你要回给谁。",
@@ -127,24 +145,28 @@ const START_INTRO_TEXT =
 // =========================
 
 async function processUpdate(update, env) {
-  const deduped = await dedupeUpdate(update, env);
-  if (deduped) return;
-
-  if (update.callback_query) {
-    await handleCallbackQuery(update.callback_query, env);
+  const updateId = getUpdateId(update);
+  if (updateId !== null && await isDuplicateUpdate(updateId, env)) {
+    logEvent("info", "update_deduped", { updateId });
     return;
   }
 
-  const msg = update.message;
-  if (!msg || msg.chat?.type !== "private") return;
-
-  const fromId = String(msg.from?.id || "");
-  if (!fromId) return;
-
-  if (fromId === String(env.OWNER_ID)) {
-    await handleOwnerMessage(msg, env);
+  if (update.callback_query) {
+    await handleCallbackQuery(update.callback_query, env);
   } else {
-    await handleUserMessage(msg, env);
+    const msg = update.message;
+    if (msg && msg.chat?.type === "private" && msg.from?.id) {
+      const fromId = String(msg.from.id);
+      if (fromId === String(env.OWNER_ID)) {
+        await handleOwnerMessage(msg, env);
+      } else {
+        await handleUserMessage(msg, env);
+      }
+    }
+  }
+
+  if (updateId !== null) {
+    await markUpdateProcessed(updateId, env);
   }
 }
 
@@ -169,7 +191,7 @@ async function handleUserMessage(msg, env) {
     return;
   }
 
-  const text = (msg.text || "").trim();
+  const text = typeof msg.text === "string" ? msg.text.trim() : "";
   const isStart = text === "/start" || text.startsWith("/start ");
 
   if (isStart) {
@@ -507,15 +529,18 @@ async function forwardUserMessageToOwner(msg, env) {
   const name = getDisplayName(msg.from);
   const username = getUsernameText(msg.from);
 
-  const isTextMessage = typeof msg.text === "string" && msg.text.length > 0;
-  const preview = isTextMessage ? buildTextPreview(msg.text, 3000) : "";
-  const previewSuffix = isTextMessage && preview !== msg.text ? "\n\n（内容过长，已截断预览）" : "";
+  const textOrCaption = getMessageTextOrCaption(msg);
+  const hasRichEntities = hasMessageEntities(msg);
+  const isPureTextMessage = typeof msg.text === "string" && msg.text.length > 0;
+  const preview = textOrCaption ? buildTextPreview(textOrCaption, 3000) : "";
+  const previewSuffix = textOrCaption && preview !== textOrCaption ? "\n\n（内容过长，已截断预览）" : "";
+
   const infoText =
     `📩 收到新私信\n\n` +
     `用户：${name}\n` +
     `用户名：${username}\n` +
     `用户ID：${userId}` +
-    (isTextMessage
+    (preview
       ? `\n\n内容预览：\n${preview}${previewSuffix}`
       : `\n\n下面是对方发来的内容，请直接回复这条说明或下面的转发消息。`);
 
@@ -530,9 +555,9 @@ async function forwardUserMessageToOwner(msg, env) {
 
   let forwardRes = { ok: false, description: "not_needed" };
   const shouldForwardOriginal =
-    !isTextMessage ||
-    msg.text.length > 3000 ||
-    (Array.isArray(msg.entities) && msg.entities.length > 0);
+    !isPureTextMessage ||
+    textOrCaption.length > 3000 ||
+    hasRichEntities;
 
   if (shouldForwardOriginal) {
     forwardRes = await tgCall(env, "forwardMessage", {
@@ -546,7 +571,7 @@ async function forwardUserMessageToOwner(msg, env) {
     }
   }
 
-  const delivered = isTextMessage ? (infoRes.ok || forwardRes.ok) : forwardRes.ok;
+  const delivered = isPureTextMessage ? (infoRes.ok || forwardRes.ok) : forwardRes.ok;
 
   if (delivered) {
     await sendMessage(env, userId, TEXTS.MESSAGE_RECEIVED);
@@ -562,7 +587,7 @@ async function forwardUserMessageToOwner(msg, env) {
     );
   }
 
-  logEvent("info", isTextMessage ? "user_text_forwarded" : "user_media_forwarded", {
+  logEvent("info", isPureTextMessage ? "user_text_forwarded" : "user_media_forwarded", {
     userId,
     ownerId,
     userMessageId: msg.message_id,
@@ -581,7 +606,7 @@ async function relayOwnerReplyToUser(msg, targetUserId, env) {
 
   if (copyRes.ok) return copyRes;
 
-  if (typeof msg.text === "string") {
+  if (typeof msg.text === "string" && msg.text.length > 0) {
     return sendMessage(env, targetUserId, msg.text);
   }
 
@@ -606,32 +631,38 @@ async function sendVerification(
   const existingChallengeId = await env.BOT_KV.get(Keys.challengeUser(userId));
   if (existingChallengeId) {
     const raw = await env.BOT_KV.get(Keys.challenge(existingChallengeId));
+    const existingState = sanitizeChallengeState(safeJsonParse(raw, null));
 
-    if (!raw) {
-      await env.BOT_KV.delete(Keys.challengeUser(userId));
-    } else {
-      const state = safeJsonParse(raw, null);
-      if (state) {
-        let pendingMessageIds = Array.isArray(state.pendingMessageIds) ? state.pendingMessageIds : [];
-
-        if (pendingMessageId) {
-          pendingMessageIds.push(pendingMessageId);
-        }
-
-        state.pendingMessageIds = [...new Set(pendingMessageIds)].slice(-CONFIG.VERIFY_PENDING_MAX);
-        state.showWelcomeAfterVerify = !!state.showWelcomeAfterVerify || !!showWelcomeAfterVerify;
-
-        if (fromUser) {
-          state.fromUser = normalizeUserSnapshot(fromUser);
-        }
-
-        await saveChallenge(env, existingChallengeId, state);
-        return;
+    if (existingState) {
+      if (pendingMessageId) {
+        existingState.pendingMessageIds = appendPendingMessageId(
+          existingState.pendingMessageIds,
+          pendingMessageId
+        );
       }
 
-      await env.BOT_KV.delete(Keys.challengeUser(userId));
-      await env.BOT_KV.delete(Keys.challenge(existingChallengeId));
+      existingState.showWelcomeAfterVerify =
+        !!existingState.showWelcomeAfterVerify || !!showWelcomeAfterVerify;
+
+      if (fromUser) {
+        existingState.fromUser = normalizeUserSnapshot(fromUser);
+      }
+
+      await saveChallenge(env, existingChallengeId, existingState);
+      await sendMessage(
+        env,
+        userId,
+        `${TEXTS.VERIFY_ALREADY_SENT}\n\n请点击下面的表情：\n${existingState.targetEmoji}`,
+        {
+          reply_markup: {
+            inline_keyboard: buildVerifyKeyboard(existingState, existingChallengeId)
+          }
+        }
+      );
+      return;
     }
+
+    await clearChallenge(env, existingChallengeId, userId);
   }
 
   const challenge = generateEmojiChallenge();
@@ -668,8 +699,17 @@ async function sendVerification(
 }
 
 async function handleCallbackQuery(cbq, env) {
-  const data = cbq.data || "";
-  const userId = String(cbq.from.id);
+  const data = typeof cbq.data === "string" ? cbq.data : "";
+  const userId = String(cbq.from?.id || "");
+
+  if (!userId) {
+    await tgCall(env, "answerCallbackQuery", {
+      callback_query_id: cbq.id,
+      text: TEXTS.VERIFY_INVALID,
+      show_alert: true
+    });
+    return;
+  }
 
   if (data.startsWith("verify:") && await isBanned(env, userId)) {
     const challengeId = data.split(":")[1];
@@ -743,13 +783,13 @@ async function handleCallbackQuery(cbq, env) {
     return;
   }
 
-  const state = safeJsonParse(raw, null);
+  const state = sanitizeChallengeState(safeJsonParse(raw, null));
   if (!state) {
     await clearChallenge(env, challengeId, userId);
 
     await tgCall(env, "answerCallbackQuery", {
       callback_query_id: cbq.id,
-      text: "验证状态异常，已为你重新发送一题。",
+      text: TEXTS.VERIFY_STATE_RESET,
       show_alert: true
     });
 
@@ -771,7 +811,7 @@ async function handleCallbackQuery(cbq, env) {
   }
 
   if (
-    Number.isNaN(selectedButtonIndex) ||
+    !Number.isInteger(selectedButtonIndex) ||
     selectedButtonIndex < 0 ||
     selectedButtonIndex >= state.buttons.length
   ) {
@@ -869,8 +909,8 @@ async function handleCallbackQuery(cbq, env) {
 
 async function forwardPendingMessagesAfterVerification(state, env) {
   const ownerId = String(env.OWNER_ID);
-  const fromUser = state.fromUser;
-  const pendingMessageIds = Array.isArray(state.pendingMessageIds) ? state.pendingMessageIds : [];
+  const fromUser = normalizeUserSnapshot(state.fromUser);
+  const pendingMessageIds = normalizePendingMessageIds(state.pendingMessageIds);
 
   if (!fromUser || pendingMessageIds.length === 0) return;
 
@@ -907,13 +947,13 @@ async function forwardPendingMessagesAfterVerification(state, env) {
     }
   }
 
-if (successCount > 0) {
-  await sendMessage(env, userId, "✅ 验证成功，刚才的消息已转交。");
-} else {
-  await sendMessage(env, userId, TEXTS.MESSAGE_TRANSFER_PARTIAL);
-}
+  if (successCount > 0) {
+    await sendMessage(env, userId, "✅ 验证成功，刚才的消息已转交。");
+  } else {
+    await sendMessage(env, userId, TEXTS.MESSAGE_TRANSFER_PARTIAL);
+  }
 
-logEvent("info", "pending_messages_forwarded_after_verify", {
+  logEvent("info", "pending_messages_forwarded_after_verify", {
     userId,
     count: successCount
   });
@@ -983,23 +1023,14 @@ async function isVerified(env, userId) {
   return !!(await env.BOT_KV.get(Keys.verified(userId)));
 }
 
-async function dedupeUpdate(update, env) {
-  const updateId = update?.update_id;
-  if (typeof updateId !== "number") return false;
+async function isDuplicateUpdate(updateId, env) {
+  return !!(await env.BOT_KV.get(Keys.update(updateId)));
+}
 
-  const key = Keys.update(updateId);
-  const exists = await env.BOT_KV.get(key);
-
-  if (exists) {
-    logEvent("info", "update_deduped", { updateId });
-    return true;
-  }
-
-  await env.BOT_KV.put(key, "1", {
+async function markUpdateProcessed(updateId, env) {
+  await env.BOT_KV.put(Keys.update(updateId), "1", {
     expirationTtl: CONFIG.UPDATE_DEDUPE_TTL
   });
-
-  return false;
 }
 
 async function checkRateLimit(env, userId, isVerifiedUser) {
@@ -1007,7 +1038,7 @@ async function checkRateLimit(env, userId, isVerifiedUser) {
   const limit = isVerifiedUser ? CONFIG.RATE_LIMIT_VERIFIED_MAX : CONFIG.RATE_LIMIT_UNVERIFIED_MAX;
   const window = isVerifiedUser ? CONFIG.RATE_LIMIT_WINDOW_VERIFIED : CONFIG.RATE_LIMIT_WINDOW_UNVERIFIED;
 
-  const current = parseInt((await env.BOT_KV.get(key)) || "0", 10);
+  const current = toSafeInteger(await env.BOT_KV.get(key), 0);
   if (current >= limit) return false;
 
   await env.BOT_KV.put(key, String(current + 1), {
@@ -1022,6 +1053,10 @@ async function checkRateLimit(env, userId, isVerifiedUser) {
 // =========================
 
 async function sendMessage(env, chatId, text, extra = {}) {
+  if (!text) {
+    return { ok: false, description: "empty text" };
+  }
+
   return tgCall(env, "sendMessage", {
     chat_id: chatId,
     text,
@@ -1046,44 +1081,90 @@ async function editMessageTextSafe(env, body) {
 }
 
 async function tgCall(env, method, body) {
-  let resp;
-  try {
-    resp = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body)
-    });
-  } catch (error) {
-    const data = {
-      ok: false,
-      description: error?.message || "telegram fetch failed"
-    };
+  let lastResult = null;
+
+  for (let attempt = 1; attempt <= CONFIG.TELEGRAM_MAX_ATTEMPTS; attempt += 1) {
+    let resp;
+    let result;
+
+    try {
+      resp = await withTimeout(
+        fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body)
+        }),
+        CONFIG.TELEGRAM_REQUEST_TIMEOUT_MS,
+        `telegram request timeout: ${method}`
+      );
+    } catch (error) {
+      result = {
+        ok: false,
+        description: error?.message || "telegram fetch failed"
+      };
+
+      logEvent("warn", "telegram_api_error", {
+        method,
+        attempt,
+        description: result.description,
+        error_code: null
+      });
+
+      if (attempt < CONFIG.TELEGRAM_MAX_ATTEMPTS) {
+        await sleep(getRetryDelayMs(null, attempt));
+        continue;
+      }
+
+      return result;
+    }
+
+    try {
+      result = await resp.json();
+    } catch {
+      result = {
+        ok: false,
+        description: `invalid telegram response (http ${resp.status})`
+      };
+    }
+
+    if (result.ok) {
+      return result;
+    }
+
+    lastResult = result;
 
     logEvent("warn", "telegram_api_error", {
       method,
-      description: data.description,
-      error_code: null
+      attempt,
+      description: result.description || null,
+      error_code: result.error_code || resp.status || null
     });
 
-    return data;
+    if (!shouldRetryTelegram(resp.status, result, attempt)) {
+      return result;
+    }
+
+    await sleep(getRetryDelayMs(result, attempt));
   }
 
-  let data;
-  try {
-    data = await resp.json();
-  } catch {
-    data = { ok: false, description: "invalid telegram response" };
+  return lastResult || { ok: false, description: "telegram call failed" };
+}
+
+function shouldRetryTelegram(status, result, attempt) {
+  if (attempt >= CONFIG.TELEGRAM_MAX_ATTEMPTS) return false;
+  if (status >= 500) return true;
+  if (result?.error_code === 429) return true;
+  return false;
+}
+
+function getRetryDelayMs(result, attempt) {
+  const retryAfterSeconds = Number(result?.parameters?.retry_after || 0);
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return clamp(retryAfterSeconds * 1000, CONFIG.TELEGRAM_RETRY_BASE_MS, CONFIG.TELEGRAM_RETRY_MAX_MS);
   }
 
-  if (!data.ok) {
-    logEvent("warn", "telegram_api_error", {
-      method,
-      description: data.description || null,
-      error_code: data.error_code || null
-    });
-  }
-
-  return data;
+  const delay = CONFIG.TELEGRAM_RETRY_BASE_MS * attempt;
+  return clamp(delay, CONFIG.TELEGRAM_RETRY_BASE_MS, CONFIG.TELEGRAM_RETRY_MAX_MS);
 }
 
 // =========================
@@ -1091,9 +1172,11 @@ async function tgCall(env, method, body) {
 // =========================
 
 function getMissingEnv(env) {
-  if (!env.BOT_TOKEN) return "BOT_TOKEN";
-  if (!env.OWNER_ID) return "OWNER_ID";
-  if (!env.BOT_KV) return "BOT_KV";
+  if (!env?.BOT_TOKEN) return "BOT_TOKEN";
+  if (!env?.OWNER_ID) return "OWNER_ID";
+  if (!env?.BOT_KV || typeof env.BOT_KV.get !== "function" || typeof env.BOT_KV.put !== "function" || typeof env.BOT_KV.delete !== "function") {
+    return "BOT_KV";
+  }
   return "";
 }
 
@@ -1127,11 +1210,14 @@ function normalizeUserId(value) {
 function normalizeUserSnapshot(fromUser) {
   if (!fromUser?.id) return null;
 
+  const normalizedId = normalizeUserId(fromUser.id);
+  if (!normalizedId) return null;
+
   return {
-    id: fromUser.id,
-    first_name: fromUser.first_name || "",
-    last_name: fromUser.last_name || "",
-    username: fromUser.username || ""
+    id: normalizedId,
+    first_name: typeof fromUser.first_name === "string" ? fromUser.first_name : "",
+    last_name: typeof fromUser.last_name === "string" ? fromUser.last_name : "",
+    username: typeof fromUser.username === "string" ? fromUser.username : ""
   };
 }
 
@@ -1148,7 +1234,83 @@ function buildTextPreview(text, maxLength = 3000) {
   return value.length > maxLength ? `${value.slice(0, maxLength)}…` : value;
 }
 
+function getMessageTextOrCaption(msg) {
+  if (typeof msg?.text === "string") return msg.text;
+  if (typeof msg?.caption === "string") return msg.caption;
+  return "";
+}
+
+function hasMessageEntities(msg) {
+  return (
+    (Array.isArray(msg?.entities) && msg.entities.length > 0) ||
+    (Array.isArray(msg?.caption_entities) && msg.caption_entities.length > 0)
+  );
+}
+
+function sanitizeChallengeState(rawState) {
+  if (!isPlainObject(rawState)) return null;
+
+  const userId = normalizeUserId(rawState.userId);
+  const targetEmoji = typeof rawState.targetEmoji === "string" ? rawState.targetEmoji : "";
+  const buttons = Array.isArray(rawState.buttons)
+    ? rawState.buttons.filter((item) => typeof item === "string" && item)
+    : [];
+
+  if (!userId) return null;
+  if (buttons.length !== 4) return null;
+  if (new Set(buttons).size !== 4) return null;
+  if (!buttons.includes(targetEmoji)) return null;
+
+  return {
+    userId,
+    targetEmoji,
+    buttons,
+    failCount: clamp(toSafeInteger(rawState.failCount, 0), 0, CONFIG.VERIFY_FAIL_MAX - 1),
+    showWelcomeAfterVerify: !!rawState.showWelcomeAfterVerify,
+    pendingMessageIds: normalizePendingMessageIds(rawState.pendingMessageIds),
+    fromUser: normalizeUserSnapshot(rawState.fromUser)
+  };
+}
+
+function appendPendingMessageId(existingIds, pendingMessageId) {
+  const ids = normalizePendingMessageIds(existingIds);
+  const normalized = normalizeSingleMessageId(pendingMessageId);
+  if (normalized === null) return ids;
+  ids.push(normalized);
+  return [...new Set(ids)].slice(-CONFIG.VERIFY_PENDING_MAX);
+}
+
+function normalizePendingMessageIds(value) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const item of value) {
+    const normalized = normalizeSingleMessageId(item);
+    if (normalized !== null) out.push(normalized);
+  }
+  return [...new Set(out)].slice(-CONFIG.VERIFY_PENDING_MAX);
+}
+
+function normalizeSingleMessageId(value) {
+  if (!Number.isInteger(value)) {
+    if (!/^-?\d+$/.test(String(value ?? "").trim())) {
+      return null;
+    }
+    value = Number(value);
+  }
+
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    return null;
+  }
+
+  return value;
+}
+
 function formatTimestamp(ts) {
+  const millis = Number(ts);
+  if (!Number.isFinite(millis) || millis <= 0) {
+    return "无";
+  }
+
   try {
     return new Intl.DateTimeFormat("zh-CN", {
       timeZone: "Asia/Shanghai",
@@ -1159,27 +1321,14 @@ function formatTimestamp(ts) {
       minute: "2-digit",
       second: "2-digit",
       hour12: false
-    }).format(new Date(ts));
+    }).format(new Date(millis));
   } catch {
-    return new Date(ts).toISOString();
+    return new Date(millis).toISOString();
   }
 }
 
-function formatDuration(seconds) {
-  const s = Number(seconds || 0);
-
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-
-  const days = Math.floor(s / 86400);
-  const hours = Math.floor((s % 86400) / 3600);
-  return `${days}d ${hours}h`;
-}
-
-function formatUnixSeconds(sec) {
-  if (!sec) return "无";
-  return formatTimestamp(sec * 1000);
+function getUpdateId(update) {
+  return Number.isInteger(update?.update_id) ? update.update_id : null;
 }
 
 function randInt(min, max) {
@@ -1191,7 +1340,7 @@ function randInt(min, max) {
 
 function shuffle(arr) {
   const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
+  for (let i = a.length - 1; i > 0; i -= 1) {
     const j = randInt(0, i);
     [a[i], a[j]] = [a[j], a[i]];
   }
@@ -1204,4 +1353,37 @@ function chunk(arr, size) {
     out.push(arr.slice(i, i + size));
   }
   return out;
+}
+
+function toSafeInteger(value, fallback = 0) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isSafeInteger(parsed) ? parsed : fallback;
+}
+
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timerId;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timerId = setTimeout(() => reject(new Error(message)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timerId) {
+      clearTimeout(timerId);
+    }
+  }
 }
