@@ -94,7 +94,10 @@ const TEXTS = {
   MENU_MESSAGE: "直接发送消息给我就可以啦 ✨",
   MENU_PICK: "请选择你想查看的内容：",
   OWNER_SELF_BAN: "不能封禁自己。",
-  INVALID_USER_ID: "用户ID格式无效。"
+  INVALID_USER_ID: "用户ID格式无效。",
+  MESSAGE_TRANSFER_FAILED: "消息转交失败，请稍后重试。",
+  MESSAGE_TRANSFER_PARTIAL: "已收到，但转交可能不完整，请稍后重试或重新发送。",
+  UNKNOWN_COMMAND: "未知命令，请发送 /start 查看可用命令。"
 };
 
 const OWNER_COMMAND_HELP =
@@ -276,8 +279,18 @@ async function routeOwnerCommand(text, env) {
     return true;
   }
 
+  if (text === "/baninfo") {
+    await sendMessage(env, ownerId, "用法：/baninfo 用户ID");
+    return true;
+  }
+
   if (text.startsWith("/baninfo ")) {
     await handleBanInfoCommand(text, env);
+    return true;
+  }
+
+  if (text === "/ban") {
+    await sendMessage(env, ownerId, "用法：/ban 用户ID [理由]");
     return true;
   }
 
@@ -286,8 +299,18 @@ async function routeOwnerCommand(text, env) {
     return true;
   }
 
+  if (text === "/unban") {
+    await sendMessage(env, ownerId, "用法：/unban 用户ID");
+    return true;
+  }
+
   if (text.startsWith("/unban ")) {
     await handleUnbanCommand(text, env);
+    return true;
+  }
+
+  if (text.startsWith("/")) {
+    await sendMessage(env, ownerId, TEXTS.UNKNOWN_COMMAND);
     return true;
   }
 
@@ -355,6 +378,18 @@ async function handleBanCommand(text, env) {
     { expirationTtl: CONFIG.BAN_TTL }
   );
 
+  const activeChallengeId = await env.BOT_KV.get(Keys.challengeUser(targetUserId));
+  if (activeChallengeId) {
+    await clearChallenge(env, activeChallengeId, targetUserId);
+  }
+
+  await Promise.all([
+    env.BOT_KV.delete(Keys.verified(targetUserId)),
+    env.BOT_KV.delete(Keys.verifyCooldown(targetUserId)),
+    env.BOT_KV.delete(Keys.rateVerified(targetUserId)),
+    env.BOT_KV.delete(Keys.rateUnverified(targetUserId))
+  ]);
+
   await sendMessage(env, ownerId, `已封禁 ${targetUserId}\n原因：${reason}`);
   logEvent("warn", "user_banned", { ownerId, targetUserId, reason });
 }
@@ -376,17 +411,13 @@ async function handleUnbanCommand(text, env) {
 async function sendOwnerStatus(env) {
   const ownerId = String(env.OWNER_ID);
 
-  const [ownerVerified, ownerCooldown, ownerBanned, activeChallengeId, webhookInfo] = await Promise.all([
-    env.BOT_KV.get(Keys.verified(ownerId)),
-    env.BOT_KV.get(Keys.verifyCooldown(ownerId)),
+  const [ownerBanned, webhookInfo] = await Promise.all([
     env.BOT_KV.get(Keys.ban(ownerId)),
-    env.BOT_KV.get(Keys.challengeUser(ownerId)),
     tgCall(env, "getWebhookInfo", {})
   ]);
 
   const webhookOk = !!webhookInfo?.ok;
   const webhook = webhookOk ? webhookInfo.result || {} : null;
-  const webhookStatus = webhookOk ? (webhook.url ? "已设置" : "未设置") : "获取失败";
 
   const healthSummary =
     webhookOk &&
@@ -396,42 +427,30 @@ async function sendOwnerStatus(env) {
       ? "正常"
       : "需要检查";
 
-  const lastErrorText =
-    webhookOk && (webhook.last_error_message || webhook.last_error_date)
-      ? `${webhook.last_error_message || "未知错误"}${webhook.last_error_date ? `\n  时间：${formatUnixSeconds(webhook.last_error_date)}` : ""}`
-      : "无";
+  const webhookStatus = webhookOk
+    ? (webhook.url ? "已设置" : "未设置")
+    : "获取失败";
+
+  const lastErrorText = webhook?.last_error_message || "无";
 
   const statusText =
-    `📊 Bot 状态面板\n` +
-    `- 健康状态：${healthSummary}\n\n` +
-    `👤 主人信息\n` +
+    `📊 Bot 状态\n\n` +
+    `- 健康状态：${healthSummary}\n` +
+    `- Webhook：${webhookStatus}\n` +
+    `- 待处理更新：${webhookOk ? webhook.pending_update_count ?? 0 : "未知"}\n` +
+    `- 最后错误：${lastErrorText}\n\n` +
+    `👤 主人\n` +
     `- Owner ID：${ownerId}\n` +
-    `- Verified：${ownerVerified ? "是" : "否"}\n` +
-    `- Cooldown：${ownerCooldown ? "是" : "否"}\n` +
-    `- Banned：${ownerBanned ? "是" : "否"}\n` +
-    `- Active Challenge：${activeChallengeId ? "有" : "无"}\n\n` +
-    `⚙️ 环境状态\n` +
-    `- BOT_TOKEN：已设置\n` +
+    `- 封禁状态：${ownerBanned ? "是" : "否"}\n\n` +
+    `⚙️ 环境\n` +
     `- BOT_KV：${env.BOT_KV ? "已绑定" : "未绑定"}\n` +
     `- START_PHOTO_FILE_ID：${env.START_PHOTO_FILE_ID ? "已设置" : "未设置"}\n\n` +
-    `🔗 Webhook 状态\n` +
-    `- 状态：${webhookStatus}\n` +
-    `- 待处理更新：${webhookOk ? webhook.pending_update_count ?? 0 : "未知"}\n` +
-    `- 最大连接数：${webhookOk ? webhook.max_connections ?? "未知" : "未知"}\n` +
-    `- 最后错误：${lastErrorText}\n\n` +
-    `🛡️ 验证配置\n` +
-    `- VERIFY_TTL：${formatDuration(CONFIG.VERIFY_TTL)}\n` +
-    `- VERIFIED_TTL：${formatDuration(CONFIG.VERIFIED_TTL)}\n` +
-    `- VERIFY_FAIL_MAX：${CONFIG.VERIFY_FAIL_MAX}\n` +
-    `- VERIFY_COOLDOWN_TTL：${formatDuration(CONFIG.VERIFY_COOLDOWN_TTL)}\n` +
-    `- VERIFY_PENDING_MAX：${CONFIG.VERIFY_PENDING_MAX}\n\n` +
-    `🚦 限流配置\n` +
-    `- 已验证用户：${CONFIG.RATE_LIMIT_VERIFIED_MAX}/${formatDuration(CONFIG.RATE_LIMIT_WINDOW_VERIFIED)}\n` +
-    `- 未验证用户：${CONFIG.RATE_LIMIT_UNVERIFIED_MAX}/${formatDuration(CONFIG.RATE_LIMIT_WINDOW_UNVERIFIED)}\n\n` +
-    `🗂️ 其他配置\n` +
-    `- OWNER_MAP_TTL：${formatDuration(CONFIG.OWNER_MAP_TTL)}\n` +
-    `- BAN_TTL：${formatDuration(CONFIG.BAN_TTL)}\n` +
-    `- UPDATE_DEDUPE_TTL：${formatDuration(CONFIG.UPDATE_DEDUPE_TTL)}`;
+    `🛡️ 验证\n` +
+    `- 冷却时间：${CONFIG.VERIFY_COOLDOWN_TTL}s\n` +
+    `- 失败上限：${CONFIG.VERIFY_FAIL_MAX}\n\n` +
+    `🚦 限流\n` +
+    `- 已验证：${CONFIG.RATE_LIMIT_VERIFIED_MAX}/${CONFIG.RATE_LIMIT_WINDOW_VERIFIED}s\n` +
+    `- 未验证：${CONFIG.RATE_LIMIT_UNVERIFIED_MAX}/${CONFIG.RATE_LIMIT_WINDOW_UNVERIFIED}s`;
 
   await sendMessage(env, ownerId, statusText);
 }
@@ -454,13 +473,21 @@ async function sendStartPack(userId, env) {
   };
 
   if (env.START_PHOTO_FILE_ID) {
-    await tgCall(env, "sendPhoto", {
+    const photoRes = await tgCall(env, "sendPhoto", {
       chat_id: userId,
       photo: env.START_PHOTO_FILE_ID,
       caption: "欢迎使用 ✨",
       reply_markup: keyboard
     });
-    return;
+
+    if (photoRes.ok) {
+      return;
+    }
+
+    logEvent("warn", "start_photo_failed_fallback_to_text", {
+      userId,
+      description: photoRes.description || null
+    });
   }
 
   await tgCall(env, "sendMessage", {
@@ -480,68 +507,68 @@ async function forwardUserMessageToOwner(msg, env) {
   const name = getDisplayName(msg.from);
   const username = getUsernameText(msg.from);
 
-  if (msg.text) {
-    const res = await tgCall(env, "sendMessage", {
-      chat_id: ownerId,
-      text:
-        `📩 收到新私信\n\n` +
-        `用户：${name}\n` +
-        `用户名：${username}\n` +
-        `用户ID：${userId}\n\n` +
-        `内容：\n${msg.text}`
-    });
-
-    if (res.ok && res.result?.message_id) {
-      await bindOwnerMessage(res.result.message_id, userId, env);
-    }
-
-    await sendMessage(env, userId, TEXTS.MESSAGE_RECEIVED);
-
-    logEvent("info", "user_text_forwarded", {
-      userId,
-      ownerId,
-      userMessageId: msg.message_id,
-      ownerMessageId: res.result?.message_id || null
-    });
-    return;
-  }
+  const isTextMessage = typeof msg.text === "string" && msg.text.length > 0;
+  const preview = isTextMessage ? buildTextPreview(msg.text, 3000) : "";
+  const previewSuffix = isTextMessage && preview !== msg.text ? "\n\n（内容过长，已截断预览）" : "";
+  const infoText =
+    `📩 收到新私信\n\n` +
+    `用户：${name}\n` +
+    `用户名：${username}\n` +
+    `用户ID：${userId}` +
+    (isTextMessage
+      ? `\n\n内容预览：\n${preview}${previewSuffix}`
+      : `\n\n下面是对方发来的内容，请直接回复这条说明或下面的转发消息。`);
 
   const infoRes = await tgCall(env, "sendMessage", {
     chat_id: ownerId,
-    text:
-      `📩 收到新私信\n\n` +
-      `用户：${name}\n` +
-      `用户名：${username}\n` +
-      `用户ID：${userId}\n\n` +
-      `下面是对方发来的内容，请直接回复这条说明或下面的转发消息。`
+    text: infoText
   });
 
   if (infoRes.ok && infoRes.result?.message_id) {
     await bindOwnerMessage(infoRes.result.message_id, userId, env);
   }
 
-  const forwardRes = await tgCall(env, "forwardMessage", {
-    chat_id: ownerId,
-    from_chat_id: msg.chat.id,
-    message_id: msg.message_id
-  });
+  let forwardRes = { ok: false, description: "not_needed" };
+  const shouldForwardOriginal =
+    !isTextMessage ||
+    msg.text.length > 3000 ||
+    (Array.isArray(msg.entities) && msg.entities.length > 0);
 
-  if (forwardRes.ok && forwardRes.result?.message_id) {
-    await bindOwnerMessage(forwardRes.result.message_id, userId, env);
+  if (shouldForwardOriginal) {
+    forwardRes = await tgCall(env, "forwardMessage", {
+      chat_id: ownerId,
+      from_chat_id: msg.chat.id,
+      message_id: msg.message_id
+    });
+
+    if (forwardRes.ok && forwardRes.result?.message_id) {
+      await bindOwnerMessage(forwardRes.result.message_id, userId, env);
+    }
   }
 
-  if (!forwardRes.ok) {
-    await sendMessage(env, ownerId, `转发媒体失败：${forwardRes.description || "unknown error"}`);
+  const delivered = isTextMessage ? (infoRes.ok || forwardRes.ok) : forwardRes.ok;
+
+  if (delivered) {
+    await sendMessage(env, userId, TEXTS.MESSAGE_RECEIVED);
+  } else {
+    await sendMessage(env, userId, TEXTS.MESSAGE_TRANSFER_FAILED);
   }
 
-  await sendMessage(env, userId, TEXTS.MESSAGE_RECEIVED);
+  if (!forwardRes.ok && shouldForwardOriginal) {
+    await sendMessage(
+      env,
+      ownerId,
+      `转发原始消息失败：${forwardRes.description || "unknown error"}`
+    );
+  }
 
-  logEvent("info", "user_media_forwarded", {
+  logEvent("info", isTextMessage ? "user_text_forwarded" : "user_media_forwarded", {
     userId,
     ownerId,
     userMessageId: msg.message_id,
     ownerInfoMessageId: infoRes.result?.message_id || null,
-    ownerForwardedMessageId: forwardRes.result?.message_id || null
+    ownerForwardedMessageId: forwardRes.result?.message_id || null,
+    delivered
   });
 }
 
@@ -622,13 +649,22 @@ async function sendVerification(
 
   await saveChallenge(env, challengeId, state);
 
-  await tgCall(env, "sendMessage", {
+  const promptRes = await tgCall(env, "sendMessage", {
     chat_id: userId,
     text: buildVerifyText(state),
     reply_markup: {
       inline_keyboard: buildVerifyKeyboard(state, challengeId)
     }
   });
+
+  if (!promptRes.ok) {
+    await clearChallenge(env, challengeId, userId);
+    logEvent("warn", "verification_prompt_send_failed", {
+      userId,
+      challengeId,
+      description: promptRes.description || null
+    });
+  }
 }
 
 async function handleCallbackQuery(cbq, env) {
@@ -871,11 +907,13 @@ async function forwardPendingMessagesAfterVerification(state, env) {
     }
   }
 
-  if (successCount > 0) {
-    await sendMessage(env, userId, "✅ 验证成功，刚才的消息已转交。");
-  }
+if (successCount > 0) {
+  await sendMessage(env, userId, "✅ 验证成功，刚才的消息已转交。");
+} else {
+  await sendMessage(env, userId, TEXTS.MESSAGE_TRANSFER_PARTIAL);
+}
 
-  logEvent("info", "pending_messages_forwarded_after_verify", {
+logEvent("info", "pending_messages_forwarded_after_verify", {
     userId,
     count: successCount
   });
@@ -1008,11 +1046,27 @@ async function editMessageTextSafe(env, body) {
 }
 
 async function tgCall(env, method, body) {
-  const resp = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
+  let resp;
+  try {
+    resp = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  } catch (error) {
+    const data = {
+      ok: false,
+      description: error?.message || "telegram fetch failed"
+    };
+
+    logEvent("warn", "telegram_api_error", {
+      method,
+      description: data.description,
+      error_code: null
+    });
+
+    return data;
+  }
 
   let data;
   try {
@@ -1087,6 +1141,11 @@ function getDisplayName(user) {
 
 function getUsernameText(user) {
   return user?.username ? `@${user.username}` : "无用户名";
+}
+
+function buildTextPreview(text, maxLength = 3000) {
+  const value = String(text || "");
+  return value.length > maxLength ? `${value.slice(0, maxLength)}…` : value;
 }
 
 function formatTimestamp(ts) {
