@@ -1,7 +1,7 @@
 name = "caihath-xdds-rtt"
 main = "worker.js"
 compatibility_date = "2026-04-05"
-
+keep_vars = true
 
 # 注意：KV 命名空间 ID 每个用户都不一样，
 # 所以不能写死在这里。用户需要在 Cloudflare 后台手动绑定。
