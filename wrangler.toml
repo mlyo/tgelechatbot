@@ -1,5 +1,5 @@
 name = "caihath-xdds-rtt"
-main = "worker.js"
+main = "_worker.js"
 compatibility_date = "2026-04-05"
 keep_vars = true
 
