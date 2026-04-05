@@ -227,12 +227,6 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/deleteWebhook?drop_pending_updates
 - 冷却状态
 - challenge 状态
 - 主人回复映射
-- 限流计数
-- update 去重标记
-
-也就是说：
-
-> 消息内容本体不存 KV，KV 只存状态和映射。
 
 ---
 
